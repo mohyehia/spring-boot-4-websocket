@@ -30,3 +30,6 @@ management:
 logging:
   pattern:
     correlation: "[${spring.application.name:},%X{traceId:-},%X{spanId:-}]"
+  level:
+    org.springframework.web.socket.messaging.StompSubProtocolHandler: trace
+    org.springframework.web.socket.sockjs.transport: debug

@@ -7,6 +7,7 @@ import org.springframework.messaging.converter.JacksonJsonMessageConverter;
 import org.springframework.messaging.converter.MessageConverter;
 import org.springframework.messaging.simp.config.ChannelRegistration;
 import org.springframework.messaging.simp.config.MessageBrokerRegistry;
+import org.springframework.scheduling.TaskScheduler;
 import org.springframework.security.messaging.access.intercept.AuthorizationChannelInterceptor;
 import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker;
 import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
@@ -21,12 +22,14 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
     private final AuthorizationInterceptor authorizationInterceptor;
     private final SecurityContextChannelInterceptor securityContextChannelInterceptor;
     private final AuthorizationChannelInterceptor authorizationChannelInterceptor;
+    private final TaskScheduler heartbeatScheduler;
 
-    public WebSocketConfig(WebsocketTracingChannelInterceptor websocketTracingChannelInterceptor, AuthorizationInterceptor authorizationInterceptor, SecurityContextChannelInterceptor securityContextChannelInterceptor, AuthorizationChannelInterceptor authorizationChannelInterceptor) {
+    public WebSocketConfig(WebsocketTracingChannelInterceptor websocketTracingChannelInterceptor, AuthorizationInterceptor authorizationInterceptor, SecurityContextChannelInterceptor securityContextChannelInterceptor, AuthorizationChannelInterceptor authorizationChannelInterceptor, TaskScheduler heartbeatScheduler) {
         this.websocketTracingChannelInterceptor = websocketTracingChannelInterceptor;
         this.authorizationInterceptor = authorizationInterceptor;
         this.securityContextChannelInterceptor = securityContextChannelInterceptor;
         this.authorizationChannelInterceptor = authorizationChannelInterceptor;
+        this.heartbeatScheduler = heartbeatScheduler;
     }
 
     @Override
@@ -36,7 +39,9 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
     @Override
     public void configureMessageBroker(MessageBrokerRegistry messageBrokerRegistry) {
-        messageBrokerRegistry.enableSimpleBroker("/topic", "/queue");
+        messageBrokerRegistry.enableSimpleBroker("/topic", "/queue")
+                .setHeartbeatValue(new long[]{10_000, 10_000}) // [server-send, server-receive] in ms
+                .setTaskScheduler(heartbeatScheduler);
         messageBrokerRegistry.setApplicationDestinationPrefixes("/app");
         messageBrokerRegistry.setUserDestinationPrefix("/user");
     }
