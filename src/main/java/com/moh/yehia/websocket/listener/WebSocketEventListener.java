@@ -1,5 +1,6 @@
-package com.moh.yehia.websocket.config;
+package com.moh.yehia.websocket.listener;
 
+import com.moh.yehia.websocket.interceptor.UserSessionTracker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.event.EventListener;
@@ -12,6 +13,11 @@ import org.springframework.web.socket.messaging.SessionUnsubscribeEvent;
 @Component
 public class WebSocketEventListener {
     private static final Logger log = LoggerFactory.getLogger(WebSocketEventListener.class);
+    private final UserSessionTracker userSessionTracker;
+
+    public WebSocketEventListener(UserSessionTracker userSessionTracker) {
+        this.userSessionTracker = userSessionTracker;
+    }
 
     @EventListener
     void handleWebsocketConnectListener(SessionConnectedEvent event) {
@@ -21,6 +27,11 @@ public class WebSocketEventListener {
     @EventListener
     void handleWebsocketDisconnectListener(SessionDisconnectEvent event) {
         log.info("websocket disconnected from server: {}", event);
+        var principal = event.getUser();
+        if (principal == null) {
+            return;
+        }
+        userSessionTracker.removeSession(event.getUser().getName());
     }
 
     @EventListener

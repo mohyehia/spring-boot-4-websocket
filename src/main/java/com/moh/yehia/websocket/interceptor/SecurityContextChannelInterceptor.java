@@ -1,4 +1,4 @@
-package com.moh.yehia.websocket.config;
+package com.moh.yehia.websocket.interceptor;
 
 import org.jspecify.annotations.NonNull;
 import org.jspecify.annotations.Nullable;

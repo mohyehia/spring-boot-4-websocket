@@ -1,5 +1,6 @@
 package com.moh.yehia.websocket.config;
 
+import com.moh.yehia.websocket.interceptor.*;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.MediaType;
 import org.springframework.messaging.converter.DefaultContentTypeResolver;
@@ -12,6 +13,7 @@ import org.springframework.security.messaging.access.intercept.AuthorizationChan
 import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker;
 import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
 import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer;
+import org.springframework.web.socket.config.annotation.WebSocketTransportRegistration;
 
 import java.util.List;
 
@@ -23,13 +25,17 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
     private final SecurityContextChannelInterceptor securityContextChannelInterceptor;
     private final AuthorizationChannelInterceptor authorizationChannelInterceptor;
     private final TaskScheduler heartbeatScheduler;
+    private final MessagesPerSessionRateLimiterInterceptor messagesPerSessionRateLimiterInterceptor;
+    private final SessionLimitPerUserInterceptor sessionLimitPerUserInterceptor;
 
-    public WebSocketConfig(WebsocketTracingChannelInterceptor websocketTracingChannelInterceptor, AuthorizationInterceptor authorizationInterceptor, SecurityContextChannelInterceptor securityContextChannelInterceptor, AuthorizationChannelInterceptor authorizationChannelInterceptor, TaskScheduler heartbeatScheduler) {
+    public WebSocketConfig(WebsocketTracingChannelInterceptor websocketTracingChannelInterceptor, AuthorizationInterceptor authorizationInterceptor, SecurityContextChannelInterceptor securityContextChannelInterceptor, AuthorizationChannelInterceptor authorizationChannelInterceptor, TaskScheduler heartbeatScheduler, MessagesPerSessionRateLimiterInterceptor rateLimiterInterceptor, SessionLimitPerUserInterceptor sessionLimitPerUserInterceptor) {
         this.websocketTracingChannelInterceptor = websocketTracingChannelInterceptor;
         this.authorizationInterceptor = authorizationInterceptor;
         this.securityContextChannelInterceptor = securityContextChannelInterceptor;
         this.authorizationChannelInterceptor = authorizationChannelInterceptor;
         this.heartbeatScheduler = heartbeatScheduler;
+        this.messagesPerSessionRateLimiterInterceptor = rateLimiterInterceptor;
+        this.sessionLimitPerUserInterceptor = sessionLimitPerUserInterceptor;
     }
 
     @Override
@@ -58,11 +64,25 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
     @Override
     public void configureClientInboundChannel(ChannelRegistration registration) {
-        registration.interceptors(authorizationInterceptor, securityContextChannelInterceptor, authorizationChannelInterceptor, websocketTracingChannelInterceptor);
+        registration.interceptors(
+                authorizationInterceptor,
+                securityContextChannelInterceptor,
+                sessionLimitPerUserInterceptor,
+                authorizationChannelInterceptor,
+                messagesPerSessionRateLimiterInterceptor,
+                websocketTracingChannelInterceptor
+        );
     }
 
     @Override
     public void configureClientOutboundChannel(ChannelRegistration registration) {
         registration.interceptors(websocketTracingChannelInterceptor);
+    }
+
+    @Override
+    public void configureWebSocketTransport(WebSocketTransportRegistration registry) {
+        registry.setMessageSizeLimit(64 * 1024); // 64KB max inbound message size => Prevents Client sending huge messages to exhaust server memory
+        registry.setSendBufferSizeLimit(512 * 1024);  // 512KB outbound buffer per session => Prevents Slow clients accumulating unsent messages in server memory
+        registry.setSendTimeLimit(20_000); // 20s max time to send a message to client => Prevents Hanging connections that never drain their buffer
     }
 }

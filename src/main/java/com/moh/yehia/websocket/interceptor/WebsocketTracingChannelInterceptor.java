@@ -1,4 +1,4 @@
-package com.moh.yehia.websocket.config;
+package com.moh.yehia.websocket.interceptor;
 
 import io.micrometer.observation.Observation;
 import io.micrometer.observation.ObservationRegistry;

@@ -1,4 +1,4 @@
-package com.moh.yehia.websocket.config;
+package com.moh.yehia.websocket.security;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
