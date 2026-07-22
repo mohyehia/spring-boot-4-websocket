@@ -56,6 +56,7 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
                 .setTaskScheduler(heartbeatScheduler);
         messageBrokerRegistry.setApplicationDestinationPrefixes("/app");
         messageBrokerRegistry.setUserDestinationPrefix("/user");
+        messageBrokerRegistry.setPreservePublishOrder(true);
     }
 
     @Override
