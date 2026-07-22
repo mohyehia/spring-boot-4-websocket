@@ -31,7 +31,7 @@ public class WebSocketEventListener {
         if (principal == null) {
             return;
         }
-        userSessionTracker.removeSession(event.getUser().getName());
+        userSessionTracker.removeSession(principal.getName());
     }
 
     @EventListener
