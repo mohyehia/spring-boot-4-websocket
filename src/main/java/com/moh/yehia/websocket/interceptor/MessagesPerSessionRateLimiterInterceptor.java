@@ -39,6 +39,7 @@ public class MessagesPerSessionRateLimiterInterceptor implements ChannelIntercep
             // logic for computing the rateTracker
             SessionRateTracker sessionRateTracker = sessionRateTrackerMap.computeIfAbsent(sessionId, k -> new SessionRateTracker(MAX_MESSAGES_PER_SECOND));
             if (!sessionRateTracker.allowMessage()) {
+                // If we need, we can send a notification to the error queue to be handled by FE
                 throw new IllegalStateException("Rate limit exceeded: max " + MAX_MESSAGES_PER_SECOND + " messages/second");
             }
         }

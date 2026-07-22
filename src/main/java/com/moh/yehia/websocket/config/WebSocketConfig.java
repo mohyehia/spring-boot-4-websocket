@@ -1,5 +1,6 @@
 package com.moh.yehia.websocket.config;
 
+import com.moh.yehia.websocket.exception.CustomStompErrorHandler;
 import com.moh.yehia.websocket.interceptor.*;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.MediaType;
@@ -27,8 +28,9 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
     private final TaskScheduler heartbeatScheduler;
     private final MessagesPerSessionRateLimiterInterceptor messagesPerSessionRateLimiterInterceptor;
     private final SessionLimitPerUserInterceptor sessionLimitPerUserInterceptor;
+    private final CustomStompErrorHandler customStompErrorHandler;
 
-    public WebSocketConfig(WebsocketTracingChannelInterceptor websocketTracingChannelInterceptor, AuthorizationInterceptor authorizationInterceptor, SecurityContextChannelInterceptor securityContextChannelInterceptor, AuthorizationChannelInterceptor authorizationChannelInterceptor, TaskScheduler heartbeatScheduler, MessagesPerSessionRateLimiterInterceptor rateLimiterInterceptor, SessionLimitPerUserInterceptor sessionLimitPerUserInterceptor) {
+    public WebSocketConfig(WebsocketTracingChannelInterceptor websocketTracingChannelInterceptor, AuthorizationInterceptor authorizationInterceptor, SecurityContextChannelInterceptor securityContextChannelInterceptor, AuthorizationChannelInterceptor authorizationChannelInterceptor, TaskScheduler heartbeatScheduler, MessagesPerSessionRateLimiterInterceptor rateLimiterInterceptor, SessionLimitPerUserInterceptor sessionLimitPerUserInterceptor, CustomStompErrorHandler customStompErrorHandler) {
         this.websocketTracingChannelInterceptor = websocketTracingChannelInterceptor;
         this.authorizationInterceptor = authorizationInterceptor;
         this.securityContextChannelInterceptor = securityContextChannelInterceptor;
@@ -36,11 +38,15 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
         this.heartbeatScheduler = heartbeatScheduler;
         this.messagesPerSessionRateLimiterInterceptor = rateLimiterInterceptor;
         this.sessionLimitPerUserInterceptor = sessionLimitPerUserInterceptor;
+        this.customStompErrorHandler = customStompErrorHandler;
     }
 
     @Override
     public void registerStompEndpoints(StompEndpointRegistry stompEndpointRegistry) {
         stompEndpointRegistry.addEndpoint("/ws").setAllowedOrigins("http://127.0.0.1:57391").withSockJS();
+
+        // register the custom StompErrorHandler
+        stompEndpointRegistry.setErrorHandler(customStompErrorHandler);
     }
 
     @Override
