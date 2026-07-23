@@ -9,6 +9,10 @@ spring:
 jwt:
   secret-key: my_application_super_super_secret_key
 
+websocket:
+  sockjs-enabled: false
+  allows-origins: http://127.0.0.1:57391
+
 management:
   endpoint:
     health:

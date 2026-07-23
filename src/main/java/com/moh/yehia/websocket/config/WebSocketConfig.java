@@ -2,6 +2,8 @@ package com.moh.yehia.websocket.config;
 
 import com.moh.yehia.websocket.exception.CustomStompErrorHandler;
 import com.moh.yehia.websocket.interceptor.*;
+import org.jspecify.annotations.NonNull;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.MediaType;
 import org.springframework.messaging.converter.DefaultContentTypeResolver;
@@ -21,6 +23,13 @@ import java.util.List;
 @Configuration
 @EnableWebSocketMessageBroker
 public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    @Value("${websocket.sockjs-enabled}")
+    private boolean sockjsEnabled;
+
+    @Value("${websocket.allows-origins}")
+    private String allowedOrigins;
+
     private final WebsocketTracingChannelInterceptor websocketTracingChannelInterceptor;
     private final AuthorizationInterceptor authorizationInterceptor;
     private final SecurityContextChannelInterceptor securityContextChannelInterceptor;
@@ -42,8 +51,13 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
     }
 
     @Override
-    public void registerStompEndpoints(StompEndpointRegistry stompEndpointRegistry) {
-        stompEndpointRegistry.addEndpoint("/ws").setAllowedOrigins("http://127.0.0.1:57391").withSockJS();
+    public void registerStompEndpoints(@NonNull StompEndpointRegistry stompEndpointRegistry) {
+
+        if (sockjsEnabled) {
+            stompEndpointRegistry.addEndpoint("/ws").setAllowedOrigins(allowedOrigins).withSockJS();
+        } else {
+            stompEndpointRegistry.addEndpoint("/ws").setAllowedOrigins(allowedOrigins);
+        }
 
         // register the custom StompErrorHandler
         stompEndpointRegistry.setErrorHandler(customStompErrorHandler);
