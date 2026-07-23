@@ -1,5 +1,6 @@
 package com.moh.yehia.websocket.service;
 
+import com.moh.yehia.websocket.metrics.WebsocketMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.messaging.simp.SimpMessageHeaderAccessor;
@@ -13,9 +14,11 @@ public class NotificationService {
 
     private static final Logger log = LoggerFactory.getLogger(NotificationService.class);
     private final SimpMessagingTemplate simpMessagingTemplate;
+    private final WebsocketMetrics websocketMetrics;
 
-    public NotificationService(SimpMessagingTemplate simpMessagingTemplate) {
+    public NotificationService(SimpMessagingTemplate simpMessagingTemplate, WebsocketMetrics websocketMetrics) {
         this.simpMessagingTemplate = simpMessagingTemplate;
+        this.websocketMetrics = websocketMetrics;
     }
 
     public void sendNotification(String message, SimpMessageHeaderAccessor simpMessageHeaderAccessor, String username) throws InterruptedException {
@@ -39,5 +42,6 @@ public class NotificationService {
                 "Received this message from you: " + message,
                 newHeaderAccessors.getMessageHeaders()
         );
+        websocketMetrics.onMessageSent();
     }
 }

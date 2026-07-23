@@ -1,5 +1,6 @@
 package com.moh.yehia.websocket.interceptor;
 
+import com.moh.yehia.websocket.metrics.WebsocketMetrics;
 import org.jspecify.annotations.NonNull;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -24,9 +25,11 @@ import java.util.concurrent.ConcurrentHashMap;
 public class AuthorizationInterceptor implements ChannelInterceptor {
     private static final Logger log = LoggerFactory.getLogger(AuthorizationInterceptor.class);
     private final JwtDecoder jwtDecoder;
+    private final WebsocketMetrics websocketMetrics;
 
-    public AuthorizationInterceptor(JwtDecoder jwtDecoder) {
+    public AuthorizationInterceptor(JwtDecoder jwtDecoder, WebsocketMetrics websocketMetrics) {
         this.jwtDecoder = jwtDecoder;
+        this.websocketMetrics = websocketMetrics;
     }
 
     @Override
@@ -82,6 +85,7 @@ public class AuthorizationInterceptor implements ChannelInterceptor {
 
             } catch (JwtException e) {
                 log.error("Invalid JWT Token: {}", e.getMessage(), e);
+                websocketMetrics.onAuthFailure();
                 throw new IllegalArgumentException("Invalid JWT Token", e);
             }
         }

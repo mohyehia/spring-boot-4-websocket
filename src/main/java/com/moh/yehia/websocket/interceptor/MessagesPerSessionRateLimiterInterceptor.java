@@ -1,5 +1,6 @@
 package com.moh.yehia.websocket.interceptor;
 
+import com.moh.yehia.websocket.metrics.WebsocketMetrics;
 import org.jspecify.annotations.NonNull;
 import org.jspecify.annotations.Nullable;
 import org.springframework.messaging.Message;
@@ -23,6 +24,11 @@ import java.util.concurrent.ConcurrentHashMap;
 public class MessagesPerSessionRateLimiterInterceptor implements ChannelInterceptor {
     private static final int MAX_MESSAGES_PER_SECOND = 5;
     private final Map<String, SessionRateTracker> sessionRateTrackerMap = new ConcurrentHashMap<>();
+    private final WebsocketMetrics websocketMetrics;
+
+    public MessagesPerSessionRateLimiterInterceptor(WebsocketMetrics websocketMetrics) {
+        this.websocketMetrics = websocketMetrics;
+    }
 
     @Override
     public @Nullable Message<?> preSend(@NonNull Message<?> message, @NonNull MessageChannel channel) {
@@ -39,9 +45,11 @@ public class MessagesPerSessionRateLimiterInterceptor implements ChannelIntercep
             // logic for computing the rateTracker
             SessionRateTracker sessionRateTracker = sessionRateTrackerMap.computeIfAbsent(sessionId, k -> new SessionRateTracker(MAX_MESSAGES_PER_SECOND));
             if (!sessionRateTracker.allowMessage()) {
+                websocketMetrics.onRateLimitHits();
                 // If we need, we can send a notification to the error queue to be handled by FE
                 throw new IllegalStateException("Rate limit exceeded: max " + MAX_MESSAGES_PER_SECOND + " messages/second");
             }
+            websocketMetrics.onMessageReceived();
         }
 
         // cleanup on disconnect
