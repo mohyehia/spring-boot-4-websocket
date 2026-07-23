@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Websockets demo</title>
+        <link
+            href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css"
+            rel="stylesheet"
+            integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB"
+            crossorigin="anonymous"
+        />
+    </head>
+    <body>
+        <div class="container mt-4">
+            <h1>Welcome to Websockets!</h1>
+
+            <div class="row mt-5">
+                <div class="col-md-6">
+                    <form>
+                        <div class="form-group">
+                            <label for="private-message">Private Message</label>
+                            <input
+                                type="text"
+                                id="private-message"
+                                class="form-control"
+                                placeholder="Enter your message here..."
+                            />
+                        </div>
+                        <button
+                            id="send"
+                            class="btn mt-2 btn-danger"
+                            type="button"
+                        >
+                            Send Message
+                        </button>
+                    </form>
+                </div>
+
+                <div class="col-md-6">
+                    <div class="form-group">
+                        <button
+                            id="sendLarge"
+                            class="btn mt-2 btn-danger"
+                            type="button"
+                        >
+                            Send Large Message
+                        </button>
+                    </div>
+                    <div class="form-group mt-5">
+                        <button
+                            id="sendMultiple"
+                            class="btn mt-2 btn-danger"
+                            type="button"
+                        >
+                            Send Multiple Messages
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="container mt-5">
+            <div class="row col-md-6">
+                <!-- Set a max-height and enable vertical auto-scrolling on the wrapper -->
+                <div
+                    class="table-responsive"
+                    style="max-height: 600px; overflow-y: auto"
+                >
+                    <table class="table table-striped table-hover">
+                        <!-- Keep the header fixed at the top during vertical scrolling -->
+                        <thead class="sticky-top bg-white">
+                            <tr>
+                                <th scope="col">#</th>
+                                <th scope="col">Server Message</th>
+                            </tr>
+                        </thead>
+                        <tbody id="general-updates">
+                            <!-- Add more rows as needed to test the scroll functionality -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="toast-container bottom-0 end-0">
+            <div
+                class="toast align-items-center"
+                id="private-toast"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+            >
+                <div class="d-flex">
+                    <div class="toast-body">
+                        <span id="toast-content"
+                            >Hello, world! This is a toast message.</span
+                        >
+                    </div>
+                    <button
+                        type="button"
+                        class="btn-close me-2 m-auto"
+                        data-bs-dismiss="toast"
+                        aria-label="Close"
+                    ></button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Toast Container (Positions the toast) -->
+        <div class="toast-container position-fixed bottom-0 end-0 p-3">
+            <!-- Error Toast Component -->
+            <div
+                id="errorToast"
+                class="toast text-bg-danger border-0"
+                role="alert"
+                aria-live="assertive"
+                aria-atomic="true"
+            >
+                <div class="d-flex">
+                    <div class="toast-body">
+                        <strong>Status:</strong> <span id="status-code"></span>
+                        <br />
+                        <strong>Error:</strong> <span id="toast-error"></span>
+                    </div>
+                    <!-- White Close Button for Dark Backgrounds -->
+                    <button
+                        type="button"
+                        class="btn-close btn-close-white me-2 m-auto"
+                        data-bs-dismiss="toast"
+                        aria-label="Close"
+                    ></button>
+                </div>
+            </div>
+        </div>
+
+        <script
+            src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"
+            integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI"
+            crossorigin="anonymous"
+        ></script>
+        <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/sockjs-client/1.6.1/sockjs.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/stomp.js/2.3.3/stomp.min.js"></script>
+        <script src="script.js"></script>
+    </body>
+</html>
