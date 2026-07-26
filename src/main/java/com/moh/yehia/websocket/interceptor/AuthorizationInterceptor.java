@@ -41,6 +41,7 @@ public class AuthorizationInterceptor implements ChannelInterceptor {
             var authHeader = accessor.getFirstNativeHeader("Authorization");
             if (authHeader == null || !authHeader.startsWith("Bearer ")) {
                 log.warn("Missing or invalid Authorization header on CONNECT");
+                websocketMetrics.onAuthFailure();
                 throw new IllegalArgumentException("Missing or invalid Authorization header");
             }
             var token = authHeader.substring("Bearer ".length());
@@ -49,6 +50,7 @@ public class AuthorizationInterceptor implements ChannelInterceptor {
                 Jwt jwt = jwtDecoder.decode(token);
                 var username = jwt.getSubject();
                 if (username == null) {
+                    websocketMetrics.onAuthFailure();
                     throw new IllegalArgumentException("JWT subject (sub) claim is missing");
                 }
                 log.info("Authenticated websocket username: {}", username);
@@ -58,6 +60,7 @@ public class AuthorizationInterceptor implements ChannelInterceptor {
                 var roles = jwt.getClaimAsStringList("roles");
                 if (roles == null || !roles.contains("USER")) {
                     log.warn("User {} does not have the required USER role", username);
+                    websocketMetrics.onAuthFailure();
                     throw new IllegalArgumentException("Insufficient permissions: USER role required");
                 }
                 // populate authorities
