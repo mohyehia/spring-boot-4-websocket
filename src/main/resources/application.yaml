@@ -12,6 +12,15 @@ jwt:
 websocket:
   sockjs-enabled: false
   allows-origins: http://127.0.0.1:57391
+  broker:
+    type: RELAY
+    relay-host: localhost
+    relay-port: 61613
+    client-login: user
+    client-passcode: secret
+    system-login: user
+    system-passcode: secret
+
 
 management:
   endpoint:

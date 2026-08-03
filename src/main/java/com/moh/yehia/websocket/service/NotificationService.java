@@ -31,7 +31,7 @@ public class NotificationService {
         newHeaderAccessors.setSessionId(sessionId);
         newHeaderAccessors.setLeaveMutable(true);
         log.info("Sending new message to the same client!");
-        Thread.sleep(10_000);
+        Thread.sleep(500);
 
         Map<String, Object> sessionAttributes = simpMessageHeaderAccessor.getSessionAttributes();
         assert sessionAttributes != null;

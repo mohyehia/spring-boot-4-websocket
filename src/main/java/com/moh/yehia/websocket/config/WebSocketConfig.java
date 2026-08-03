@@ -30,6 +30,28 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
     @Value("${websocket.allows-origins}")
     private String allowedOrigins;
 
+    @Value("${websocket.broker.type}")
+    private String brokerType;
+
+    @Value("${websocket.broker.relay-host}")
+    private String relayHost;
+
+    @Value("${websocket.broker.relay-port}")
+    private int relayPort;
+
+    @Value("${websocket.broker.client-login:guest}")
+    private String clientLogin;
+
+    @Value("${websocket.broker.client-passcode:guest}")
+    private String clientPasscode;
+
+    @Value("${websocket.broker.system-login:guest}")
+    private String systemLogin;
+
+    @Value("${websocket.broker.system-passcode:guest}")
+    private String systemPasscode;
+
+
     private final WebsocketTracingChannelInterceptor websocketTracingChannelInterceptor;
     private final AuthorizationInterceptor authorizationInterceptor;
     private final SecurityContextChannelInterceptor securityContextChannelInterceptor;
@@ -52,7 +74,6 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
     @Override
     public void registerStompEndpoints(@NonNull StompEndpointRegistry stompEndpointRegistry) {
-
         if (sockjsEnabled) {
             stompEndpointRegistry.addEndpoint("/ws").setAllowedOrigins(allowedOrigins).withSockJS();
         } else {
@@ -64,10 +85,24 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
     }
 
     @Override
-    public void configureMessageBroker(MessageBrokerRegistry messageBrokerRegistry) {
-        messageBrokerRegistry.enableSimpleBroker("/topic", "/queue")
-                .setHeartbeatValue(new long[]{10_000, 10_000}) // [server-send, server-receive] in ms
-                .setTaskScheduler(heartbeatScheduler);
+    public void configureMessageBroker(@NonNull MessageBrokerRegistry messageBrokerRegistry) {
+        if (brokerType.equalsIgnoreCase(BrokerType.RELAY.name())) {
+            messageBrokerRegistry.enableStompBrokerRelay("/topic", "/queue")
+                    .setRelayHost(relayHost)
+                    .setRelayPort(relayPort)
+                    .setClientLogin(clientLogin)
+                    .setClientPasscode(clientPasscode)
+                    .setSystemLogin(systemLogin)
+                    .setSystemPasscode(systemPasscode)
+                    .setVirtualHost("/")
+                    .setSystemHeartbeatSendInterval(10_000)
+                    .setSystemHeartbeatReceiveInterval(10_000)
+                    .setTaskScheduler(heartbeatScheduler);
+        } else {
+            messageBrokerRegistry.enableSimpleBroker("/topic", "/queue")
+                    .setHeartbeatValue(new long[]{10_000, 10_000}) // [server-send, server-receive] in ms
+                    .setTaskScheduler(heartbeatScheduler);
+        }
         messageBrokerRegistry.setApplicationDestinationPrefixes("/app");
         messageBrokerRegistry.setUserDestinationPrefix("/user");
         messageBrokerRegistry.setPreservePublishOrder(true);
