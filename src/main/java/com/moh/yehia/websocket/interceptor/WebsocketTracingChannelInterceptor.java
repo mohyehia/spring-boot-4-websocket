@@ -1,12 +1,8 @@
 package com.moh.yehia.websocket.interceptor;
 
-import io.micrometer.observation.Observation;
-import io.micrometer.observation.ObservationRegistry;
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.context.Context;
-import io.opentelemetry.context.Scope;
-import io.opentelemetry.context.propagation.TextMapGetter;
-import io.opentelemetry.context.propagation.TextMapPropagator;
+import io.micrometer.tracing.Span;
+import io.micrometer.tracing.TraceContext;
+import io.micrometer.tracing.Tracer;
 import org.jspecify.annotations.NonNull;
 import org.jspecify.annotations.Nullable;
 import org.springframework.context.annotation.Configuration;
@@ -18,107 +14,235 @@ import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
 import org.springframework.messaging.support.ExecutorChannelInterceptor;
 import org.springframework.messaging.support.MessageHeaderAccessor;
 
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+
 @Configuration
 public class WebsocketTracingChannelInterceptor implements ExecutorChannelInterceptor {
-    private final ObservationRegistry observationRegistry;
-    private final OpenTelemetry openTelemetry;
+    private final Tracer tracer;
 
-    private static final String OBSERVATION_KEY = "micrometer.observation";
-    private static final ThreadLocal<Observation.Scope> SCOPE_HOLDER = new ThreadLocal<>();
-    private static final ThreadLocal<Scope> OTEL_SCOPE_HOLDER = new ThreadLocal<>();
+    private static final ThreadLocal<Tracer.SpanInScope> CONNECT_SCOPE_HOLDER = new ThreadLocal<>();
+    private static final ThreadLocal<Tracer.SpanInScope> MESSAGE_SCOPE_HOLDER = new ThreadLocal<>();
+
     private static final String UNKNOWN = "unknown";
 
-    public WebsocketTracingChannelInterceptor(ObservationRegistry observationRegistry, OpenTelemetry openTelemetry) {
-        this.observationRegistry = observationRegistry;
-        this.openTelemetry = openTelemetry;
+    private static final String SPAN_KEY = "micrometer.websocket.span";
+    private static final String TRACE_CONTEXT_KEY = "micrometer.trace.context";
+    private static final String DESTINATION_KEY = "websocket.destination";
+    private static final String DIRECTION_KEY = "websocket.direction";
+    private static final String SESSION_ID_KEY = "websocket.sessionId";
+    private static final String SESSION_TRACE_CONTEXT_KEY = "micrometer.session.trace.context";
+
+    private static final String TRACEPARENT_HEADER = "traceparent";
+    private static final String W3C_TRACE_VERSION = "00";
+    private static final String SAMPLED_FLAG = "01";
+    private static final String NOT_SAMPLED_FLAG = "00";
+
+    public WebsocketTracingChannelInterceptor(Tracer tracer) {
+        this.tracer = tracer;
     }
 
     @Override
+    @SuppressWarnings("java:S2638")
     public @Nullable Message<?> preSend(@NonNull Message<?> message, @NonNull MessageChannel channel) {
         var headerAccessors = MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
-        if (headerAccessors != null && headerAccessors.isMutable() && (
-                StompCommand.SEND.equals(headerAccessors.getCommand())
-                        || StompCommand.MESSAGE.equals(headerAccessors.getCommand())
-                        || StompCommand.SUBSCRIBE.equals(headerAccessors.getCommand())
-                        || StompCommand.UNSUBSCRIBE.equals(headerAccessors.getCommand())
-                        || StompCommand.CONNECT.equals(headerAccessors.getCommand())
-                        || StompCommand.DISCONNECT.equals(headerAccessors.getCommand())
-        )) {
-            var destination = headerAccessors.getDestination();
-            var direction = switch (headerAccessors.getCommand()) {
-                case SEND, CONNECT, SUBSCRIBE, UNSUBSCRIBE, DISCONNECT -> "inbound";
-                case MESSAGE -> "outbound";
-                default -> UNKNOWN;
-            };
-            var sessionId = headerAccessors.getSessionId() == null ? UNKNOWN : headerAccessors.getSessionId();
-
-            // Extract parent trace context from STOMP native headers (e.g., traceparent)
-            if (StompCommand.SEND.equals(headerAccessors.getCommand())) {
-                TextMapPropagator propagator = openTelemetry.getPropagators().getTextMapPropagator();
-                Context extractedContext = propagator.extract(Context.current(), headerAccessors, STOMP_HEADER_ACCESSOR_TEXT_MAP_GETTER);
-                Scope otelScope = extractedContext.makeCurrent();
-                OTEL_SCOPE_HOLDER.set(otelScope);
-            }
-
-            var observation = Observation
-                    .createNotStarted("websocket." + direction, observationRegistry)
-                    .contextualName("websocket " + direction + " " + destination)
-                    .lowCardinalityKeyValue("destination", destination != null ? destination : UNKNOWN)
-                    .lowCardinalityKeyValue("direction", direction)
-                    .highCardinalityKeyValue("sessionId", sessionId)
-                    .start();
-            headerAccessors.setHeader(OBSERVATION_KEY, observation);
+        if (headerAccessors == null || !headerAccessors.isMutable()) {
+            return message;
         }
+
+        var command = headerAccessors.getCommand();
+        if (notSupportedCommand(command)) {
+            return message;
+        }
+
+        var destination = headerAccessors.getDestination();
+        var direction = getDirection(command);
+        String sessionId = Objects.requireNonNullElse(headerAccessors.getSessionId(), UNKNOWN);
+
+        headerAccessors.setHeader(DESTINATION_KEY, destination);
+        headerAccessors.setHeader(DIRECTION_KEY, direction);
+        headerAccessors.setHeader(SESSION_ID_KEY, sessionId);
+
+        TraceContext parentContext = resolveParentContext(headerAccessors);
+
+        String spanName = StompCommand.CONNECT.equals(command)
+                ? "websocket.authorization"
+                : "websocket." + direction;
+
+        Span span = createSpan(spanName, parentContext, destination, direction, sessionId);
+
+        headerAccessors.setHeader(SPAN_KEY, span);
+
+        if (StompCommand.CONNECT.equals(command)) {
+            Tracer.SpanInScope scope = tracer.withSpan(span);
+            CONNECT_SCOPE_HOLDER.set(scope);
+            getSessionAttributes(headerAccessors).put(SESSION_TRACE_CONTEXT_KEY, span.context());
+        } else {
+            headerAccessors.setHeader(TRACE_CONTEXT_KEY, span.context());
+        }
+
+        if (StompCommand.MESSAGE.equals(command)) {
+            injectTraceParent(headerAccessors, span.context());
+        }
+
         return message;
     }
 
     @Override
-    public @Nullable Message<?> beforeHandle(@NonNull Message<?> message, @NonNull MessageChannel channel, @NonNull MessageHandler handler) {
+    @SuppressWarnings("java:S2638")
+    public @Nullable Message<?> beforeHandle(
+            @NonNull Message<?> message,
+            @NonNull MessageChannel channel,
+            @NonNull MessageHandler handler
+    ) {
         var headerAccessors = MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
-        if (headerAccessors != null) {
-            var observation = (Observation) headerAccessors.getHeader(OBSERVATION_KEY);
-            if (observation != null) {
-                Observation.Scope scope = observation.openScope();
-                SCOPE_HOLDER.set(scope);
-            }
+
+        if (headerAccessors == null
+                || notSupportedCommand(headerAccessors.getCommand())
+                || StompCommand.CONNECT.equals(headerAccessors.getCommand())) {
+            return message;
         }
+
+        Object spanHeader = headerAccessors.getHeader(SPAN_KEY);
+        if (spanHeader instanceof Span span) {
+            Tracer.SpanInScope scope = tracer.withSpan(span);
+            MESSAGE_SCOPE_HOLDER.set(scope);
+        }
+
         return message;
     }
 
     @Override
-    public void afterMessageHandled(@NonNull Message<?> message, @NonNull MessageChannel channel, @NonNull MessageHandler handler, @Nullable Exception ex) {
-        // Close Observation scope first (opened last in beforeHandle)
-        Observation.Scope scope = SCOPE_HOLDER.get();
+    public void afterSendCompletion(
+            @NonNull Message<?> message,
+            @NonNull MessageChannel channel,
+            boolean sent,
+            @Nullable Exception ex
+    ) {
+        var headerAccessors = MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
+        if (headerAccessors == null || !StompCommand.CONNECT.equals(headerAccessors.getCommand())) {
+            return;
+        }
+
+        Object spanHeader = headerAccessors.getHeader(SPAN_KEY);
+
+        if (spanHeader instanceof Span span) {
+            if (ex != null) {
+                span.error(ex);
+            }
+
+            Tracer.SpanInScope scope = CONNECT_SCOPE_HOLDER.get();
+            if (scope != null) {
+                scope.close();
+                CONNECT_SCOPE_HOLDER.remove();
+            }
+
+            span.end();
+        } else {
+            CONNECT_SCOPE_HOLDER.remove();
+        }
+    }
+
+    @Override
+    public void afterMessageHandled(
+            @NonNull Message<?> message,
+            @NonNull MessageChannel channel,
+            @NonNull MessageHandler handler,
+            @Nullable Exception ex
+    ) {
+        var headerAccessors = MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
+        if (headerAccessors == null || StompCommand.CONNECT.equals(headerAccessors.getCommand())) {
+            return;
+        }
+
+        Object spanHeader = headerAccessors.getHeader(SPAN_KEY);
+
+        Tracer.SpanInScope scope = MESSAGE_SCOPE_HOLDER.get();
         if (scope != null) {
             scope.close();
-            SCOPE_HOLDER.remove();
-            Observation observation = scope.getCurrentObservation();
-            if (ex != null) {
-                observation.error(ex);
-            }
-            observation.stop();
+            MESSAGE_SCOPE_HOLDER.remove();
         }
-        // Close OTel scope last (opened first in preSend)
-        Scope otelScope = OTEL_SCOPE_HOLDER.get();
-        if (otelScope != null) {
-            otelScope.close();
-            OTEL_SCOPE_HOLDER.remove();
+
+        if (spanHeader instanceof Span span) {
+            if (ex != null) {
+                span.error(ex);
+            }
+            span.end();
         }
     }
 
-    // The below code is for extracting traceparent from FE if they are using Opentelemetry JS
-    private static final TextMapGetter<StompHeaderAccessor> STOMP_HEADER_ACCESSOR_TEXT_MAP_GETTER = new TextMapGetter<StompHeaderAccessor>() {
+    private static boolean notSupportedCommand(StompCommand command) {
+        return !StompCommand.SEND.equals(command)
+                && !StompCommand.MESSAGE.equals(command)
+                && !StompCommand.SUBSCRIBE.equals(command)
+                && !StompCommand.UNSUBSCRIBE.equals(command)
+                && !StompCommand.CONNECT.equals(command)
+                && !StompCommand.DISCONNECT.equals(command);
+    }
 
-        @Override
-        public Iterable<String> keys(StompHeaderAccessor carrier) {
-            return carrier.toNativeHeaderMap().keySet();
+    private static String getDirection(StompCommand command) {
+        return switch (Objects.requireNonNull(command)) {
+            case SEND, CONNECT, SUBSCRIBE, UNSUBSCRIBE, DISCONNECT -> "inbound";
+            case MESSAGE -> "outbound";
+            default -> UNKNOWN;
+        };
+    }
+
+    private static TraceContext resolveParentContext(StompHeaderAccessor headerAccessors) {
+        var sessionAttributes = headerAccessors.getSessionAttributes();
+        if (sessionAttributes == null) {
+            return null;
         }
 
-        @Override
-        public String get(StompHeaderAccessor carrier, String key) {
-            assert carrier != null;
-            var values = carrier.getNativeHeader(key);
-            return (values != null && !values.isEmpty()) ? values.getFirst() : null;
+        Object sessionContext = sessionAttributes.get(SESSION_TRACE_CONTEXT_KEY);
+        if (sessionContext instanceof TraceContext traceContext) {
+            return traceContext;
         }
-    };
+
+        return null;
+    }
+
+    private Span createSpan(
+            String spanName,
+            @Nullable TraceContext parentContext,
+            @Nullable String destination,
+            String direction,
+            String sessionId
+    ) {
+        Span.Builder builder = tracer.spanBuilder()
+                .name(spanName)
+                .tag("destination", destination != null ? destination : UNKNOWN)
+                .tag("direction", direction)
+                .tag("sessionId", sessionId);
+
+        if (parentContext != null) {
+            builder.setParent(parentContext);
+        }
+
+        return builder.start();
+    }
+
+    private static void injectTraceParent(StompHeaderAccessor headerAccessors, TraceContext traceContext) {
+        String traceParent = W3C_TRACE_VERSION
+                + "-"
+                + traceContext.traceId()
+                + "-"
+                + traceContext.spanId()
+                + "-"
+                + (Boolean.TRUE.equals(traceContext.sampled()) ? SAMPLED_FLAG : NOT_SAMPLED_FLAG);
+
+        headerAccessors.setNativeHeader(TRACEPARENT_HEADER, traceParent);
+    }
+
+    private static Map<String, Object> getSessionAttributes(StompHeaderAccessor headerAccessors) {
+        var sessionAttributes = headerAccessors.getSessionAttributes();
+
+        if (sessionAttributes == null) {
+            sessionAttributes = new ConcurrentHashMap<>();
+            headerAccessors.setSessionAttributes(sessionAttributes);
+        }
+
+        return sessionAttributes;
+    }
 }

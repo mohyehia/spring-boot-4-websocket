@@ -41,7 +41,8 @@ management:
   otlp:
     metrics:
       export:
-        enabled: false
+        enabled: true
+        batch-size: 10000
 
 logging:
   pattern:

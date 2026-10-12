@@ -1,4 +1,14 @@
 services:
+  otel-lgtm:
+    image: 'grafana/otel-lgtm:latest'
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+      - '4317:4317'
+      - '4318:4318'
+      - '9090:9090'
+      - '3100:3100'
+
   rabbitmq:
     image: rabbitmq:management-alpine
     container_name: rabbitmq

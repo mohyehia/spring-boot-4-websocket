@@ -1,255 +1,360 @@
-# WebSocket Tracing with Micrometer, OpenTelemetry & Spring Boot
+# WebSocket Tracing with Micrometer Tracing and Spring Boot
 
 ## Problem
 
-WebSocket/STOMP messages **do not** go through the standard servlet filter chain. This means:
-- No automatic trace context (traceId/spanId) is generated for `@MessageMapping` methods
-- Log correlation is missing for WebSocket message handling
-- Outbound messages (server → client) are also untraced
+WebSocket/STOMP messages do **not** go through the normal servlet request lifecycle once the WebSocket connection is established. This means normal HTTP tracing does not automatically cover:
 
-## Solution: Custom `ExecutorChannelInterceptor`
+- STOMP `CONNECT`, `SEND`, `SUBSCRIBE`, `UNSUBSCRIBE`, `DISCONNECT` frames
+- `@MessageMapping` method execution
+- Server-to-client STOMP `MESSAGE` frames
+- Log correlation inside WebSocket message handling threads
 
-Implement an `ExecutorChannelInterceptor` that:
-1. Creates an `Observation` for each STOMP frame (inbound and outbound)
-2. Opens a scope so the traceId/spanId propagate to the MDC
-3. Extracts parent trace context from frontend (`traceparent` header) for distributed tracing
-4. Tags spans with direction and session ID
+The current solution adds explicit STOMP channel tracing by using a custom `ExecutorChannelInterceptor`.
 
 ---
 
-## Why `ExecutorChannelInterceptor` instead of `ChannelInterceptor`?
+## Current Implementation Summary
 
-- `ChannelInterceptor` only provides `preSend` / `afterSendCompletion` — these run when the message is dispatched to the channel, **not necessarily on the same thread** as your `@MessageMapping` handler.
-- `ExecutorChannelInterceptor` adds `beforeHandle` / `afterMessageHandled` — these run on the **same thread** as the message handler, which is required for MDC propagation.
+The project currently uses:
 
----
+- `io.micrometer.tracing.Tracer`
+- `io.micrometer.tracing.Span`
+- `io.micrometer.tracing.TraceContext`
+- `ExecutorChannelInterceptor`
+- STOMP session attributes for trace context propagation across the lifetime of a WebSocket session
+- `ThreadLocal` holders for span/scope lifecycle management
 
-## Key Design Decisions
+Current implementation file:
 
-### 1. Guard with `isMutable()` before setting headers
+```text
+src/main/java/com/moh/yehia/websocket/interceptor/WebsocketTracingChannelInterceptor.java
+```
 
-Some STOMP frames (e.g., system-generated `DISCONNECT`) have **immutable headers**. Calling `setHeader()` on them throws `IllegalStateException: Already immutable`. Always check `headerAccessors.isMutable()` before writing.
+The interceptor traces these STOMP commands:
 
-### 2. Trace all STOMP commands, not just `SEND`
+| Command       | Direction | Span name                 |
+|---------------|-----------|---------------------------|
+| `CONNECT`     | inbound   | `websocket.authorization` |
+| `SEND`        | inbound   | `websocket.inbound`       |
+| `SUBSCRIBE`   | inbound   | `websocket.inbound`       |
+| `UNSUBSCRIBE` | inbound   | `websocket.inbound`       |
+| `DISCONNECT`  | inbound   | `websocket.inbound`       |
+| `MESSAGE`     | outbound  | `websocket.outbound`      |
 
-| Command       | Direction  | Description                        |
-|---------------|------------|------------------------------------|
-| `SEND`        | inbound    | Client sends a message to server   |
-| `CONNECT`     | inbound    | Client opens WebSocket connection  |
-| `SUBSCRIBE`   | inbound    | Client subscribes to a destination |
-| `UNSUBSCRIBE` | inbound    | Client unsubscribes                |
-| `DISCONNECT`  | inbound    | Client disconnects                 |
-| `MESSAGE`     | outbound   | Server sends a message to client   |
+Each span is tagged with:
 
-### 3. Use `ThreadLocal` for the Observation Scope (headers are immutable by `beforeHandle`)
-
-By the time `beforeHandle` is called, message headers are **immutable**. Use a `ThreadLocal` to hold the scope on the handler thread.
-
-### 4. Extract parent trace context from frontend (Distributed Tracing)
-
-If the frontend uses OpenTelemetry JS and sends a `traceparent` STOMP native header, the interceptor extracts it and creates a **child span** instead of a new root trace. This links frontend and backend traces together in your tracing backend (Jaeger, Zipkin, Tempo, etc.).
-
-If no `traceparent` header is present, `propagator.extract()` returns `Context.current()` unchanged — a new root trace is created automatically.
-
-### 5. OTel scope management
-
-`extractedContext.makeCurrent()` returns an `io.opentelemetry.context.Scope` that **must be closed** to prevent context leaks. Store it in a `ThreadLocal` and close it in `afterMessageHandled`.
-
-### 6. Scope close order (LIFO)
-
-Scopes must be closed in **reverse order** of how they were opened:
-1. **OTel scope** opened in `preSend` (first)
-2. **Observation scope** opened in `beforeHandle` (second)
-
-Close order in `afterMessageHandled`:
-1. Close **Observation scope** first (opened last)
-2. Close **OTel scope** last (opened first)
-
-### 7. Session ID as a high-cardinality tag
-
-Session IDs are unique per connection — thousands of unique values. They are tagged as `highCardinalityKeyValue` so they appear in **traces** (for debugging) but not in **metrics** (which would cause metric cardinality explosion).
+| Tag           | Meaning                                              |
+|---------------|------------------------------------------------------|
+| `destination` | STOMP destination, or `unknown` when absent          |
+| `direction`   | `inbound`, `outbound`, or `unknown`                  |
+| `sessionId`   | WebSocket/STOMP session ID, or `unknown` when absent |
 
 ---
 
-## Full Implementation
+## Why `ExecutorChannelInterceptor`?
+
+`ChannelInterceptor` provides methods like `preSend()` and `afterSendCompletion()`. These run when a message is sent to a channel, but not necessarily on the same thread that executes the message handler.
+
+`ExecutorChannelInterceptor` adds:
+
+- `beforeHandle()`
+- `afterMessageHandled()`
+
+These callbacks wrap actual message handling and are the correct place to open a tracing scope for `@MessageMapping` execution and outbound message delivery.
+
+That is why the current interceptor implements:
 
 ```java
-package com.moh.yehia.websocket.config;
-
-import io.micrometer.observation.Observation;
-import io.micrometer.observation.ObservationRegistry;
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.context.Context;
-import io.opentelemetry.context.Scope;
-import io.opentelemetry.context.propagation.TextMapGetter;
-import io.opentelemetry.context.propagation.TextMapPropagator;
-import org.jspecify.annotations.NonNull;
-import org.jspecify.annotations.Nullable;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.messaging.Message;
-import org.springframework.messaging.MessageChannel;
-import org.springframework.messaging.MessageHandler;
-import org.springframework.messaging.simp.stomp.StompCommand;
-import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
-import org.springframework.messaging.support.ExecutorChannelInterceptor;
-import org.springframework.messaging.support.MessageHeaderAccessor;
-
-@Configuration
-public class WebsocketTracingChannelInterceptor implements ExecutorChannelInterceptor {
-    private final ObservationRegistry observationRegistry;
-    private final OpenTelemetry openTelemetry;
-
-    private static final String OBSERVATION_KEY = "micrometer.observation";
-    private static final ThreadLocal<Observation.Scope> SCOPE_HOLDER = new ThreadLocal<>();
-    private static final ThreadLocal<Scope> OTEL_SCOPE_HOLDER = new ThreadLocal<>();
-    private static final String UNKNOWN = "unknown";
-
-    public WebsocketTracingChannelInterceptor(ObservationRegistry observationRegistry, OpenTelemetry openTelemetry) {
-        this.observationRegistry = observationRegistry;
-        this.openTelemetry = openTelemetry;
-    }
-
-    @Override
-    public @Nullable Message<?> preSend(@NonNull Message<?> message, @NonNull MessageChannel channel) {
-        var headerAccessors = MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
-        if (headerAccessors != null && headerAccessors.isMutable() && (
-                StompCommand.SEND.equals(headerAccessors.getCommand())
-                        || StompCommand.MESSAGE.equals(headerAccessors.getCommand())
-                        || StompCommand.SUBSCRIBE.equals(headerAccessors.getCommand())
-                        || StompCommand.UNSUBSCRIBE.equals(headerAccessors.getCommand())
-                        || StompCommand.CONNECT.equals(headerAccessors.getCommand())
-                        || StompCommand.DISCONNECT.equals(headerAccessors.getCommand())
-        )) {
-            var destination = headerAccessors.getDestination();
-            var direction = switch (headerAccessors.getCommand()) {
-                case SEND, CONNECT, SUBSCRIBE, UNSUBSCRIBE, DISCONNECT -> "inbound";
-                case MESSAGE -> "outbound";
-                default -> UNKNOWN;
-            };
-            var sessionId = headerAccessors.getSessionId() == null ? UNKNOWN : headerAccessors.getSessionId();
-
-            // Extract parent trace context from STOMP native headers (e.g., traceparent)
-            if (StompCommand.SEND.equals(headerAccessors.getCommand())) {
-                TextMapPropagator propagator = openTelemetry.getPropagators().getTextMapPropagator();
-                Context extractedContext = propagator.extract(Context.current(), headerAccessors, STOMP_HEADER_ACCESSOR_TEXT_MAP_GETTER);
-                Scope otelScope = extractedContext.makeCurrent();
-                OTEL_SCOPE_HOLDER.set(otelScope);
-            }
-
-            var observation = Observation
-                    .createNotStarted("websocket." + direction, observationRegistry)
-                    .contextualName("websocket " + direction + " " + destination)
-                    .lowCardinalityKeyValue("destination", destination != null ? destination : UNKNOWN)
-                    .lowCardinalityKeyValue("direction", direction)
-                    .highCardinalityKeyValue("sessionId", sessionId)
-                    .start();
-            headerAccessors.setHeader(OBSERVATION_KEY, observation);
-        }
-        return message;
-    }
-
-    @Override
-    public @Nullable Message<?> beforeHandle(@NonNull Message<?> message, @NonNull MessageChannel channel, @NonNull MessageHandler handler) {
-        var headerAccessors = MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
-        if (headerAccessors != null) {
-            var observation = (Observation) headerAccessors.getHeader(OBSERVATION_KEY);
-            if (observation != null) {
-                Observation.Scope scope = observation.openScope();
-                SCOPE_HOLDER.set(scope);
-            }
-        }
-        return message;
-    }
-
-    @Override
-    public void afterMessageHandled(@NonNull Message<?> message, @NonNull MessageChannel channel, @NonNull MessageHandler handler, @Nullable Exception ex) {
-        // Close Observation scope first (opened last in beforeHandle)
-        Observation.Scope scope = SCOPE_HOLDER.get();
-        if (scope != null) {
-            scope.close();
-            SCOPE_HOLDER.remove();
-            Observation observation = scope.getCurrentObservation();
-            if (ex != null) {
-                observation.error(ex);
-            }
-            observation.stop();
-        }
-        // Close OTel scope last (opened first in preSend)
-        Scope otelScope = OTEL_SCOPE_HOLDER.get();
-        if (otelScope != null) {
-            otelScope.close();
-            OTEL_SCOPE_HOLDER.remove();
-        }
-    }
-
-    // Extract traceparent from FE if they are using OpenTelemetry JS
-    private static final TextMapGetter<StompHeaderAccessor> STOMP_HEADER_ACCESSOR_TEXT_MAP_GETTER = new TextMapGetter<>() {
-        @Override
-        public Iterable<String> keys(StompHeaderAccessor carrier) {
-            return carrier.toNativeHeaderMap().keySet();
-        }
-
-        @Override
-        public String get(StompHeaderAccessor carrier, String key) {
-            assert carrier != null;
-            var values = carrier.getNativeHeader(key);
-            return (values != null && !values.isEmpty()) ? values.getFirst() : null;
-        }
-    };
-}
+public class WebsocketTracingChannelInterceptor implements ExecutorChannelInterceptor
 ```
 
 ---
 
-## Registration in WebSocketConfig
+## Registration in `WebSocketConfig`
 
-Register the interceptor on **both** inbound and outbound channels:
+The interceptor is registered on both inbound and outbound channels.
+
+### Inbound channel
 
 ```java
 @Override
 public void configureClientInboundChannel(ChannelRegistration registration) {
-    registration.interceptors(websocketTracingChannelInterceptor);
+    registration.interceptors(
+            websocketTracingChannelInterceptor,
+            authorizationInterceptor,
+            securityContextChannelInterceptor,
+            sessionLimitPerUserInterceptor,
+            authorizationChannelInterceptor,
+            messagesPerSessionRateLimiterInterceptor
+    );
 }
+```
 
+The tracing interceptor is intentionally first. This allows it to create a `CONNECT` span before authentication/authorization interceptors run, so connection failures can still be associated with a span.
+
+### Outbound channel
+
+```java
 @Override
 public void configureClientOutboundChannel(ChannelRegistration registration) {
     registration.interceptors(websocketTracingChannelInterceptor);
 }
 ```
 
-- **Inbound channel:** traces client → server messages (`SEND`, `CONNECT`, `SUBSCRIBE`, `UNSUBSCRIBE`, `DISCONNECT`)
-- **Outbound channel:** traces server → client messages (`MESSAGE` from `convertAndSendToUser()`)
+This traces server-to-client STOMP `MESSAGE` frames, including messages sent through `SimpMessagingTemplate.convertAndSendToUser(...)`.
 
 ---
 
-## Frontend Trace Propagation (OpenTelemetry JS)
+## Lifecycle: `CONNECT`
 
-If the frontend uses OpenTelemetry JS, it should send the `traceparent` header when sending STOMP messages:
+`CONNECT` is handled differently from normal messages.
 
-```javascript
-// Using OpenTelemetry JS
-const span = tracer.startSpan('websocket.send');
-const ctx = trace.setSpan(context.active(), span);
+### `preSend()`
 
-const headers = {};
-propagation.inject(ctx, headers);
+For `CONNECT`, the interceptor:
 
-// Send STOMP message with trace headers
-stompClient.send("/app/notification", {
-    'traceparent': headers.traceparent,
-    'tracestate': headers.tracestate || ''
-}, JSON.stringify(payload));
+1. Reads STOMP metadata from `StompHeaderAccessor`
+2. Sets internal tracing headers while headers are still mutable
+3. Creates a span named `ws.authorization`
+4. Opens the span scope immediately
+5. Stores the span and scope in `ThreadLocal`s
+6. Stores the `TraceContext` in STOMP session attributes
 
-span.end();
+Simplified flow:
+
+```java
+if (StompCommand.CONNECT.equals(command)) {
+    Span span = createSpan("websocket.authorization", null, destination, direction, sessionId);
+    Tracer.SpanInScope scope = tracer.withSpan(span);
+    CONNECT_SPAN_HOLDER.set(span);
+    CONNECT_SCOPE_HOLDER.set(scope);
+    getSessionAttributes(headerAccessors).put(SESSION_TRACE_CONTEXT_KEY, span.context());
+}
 ```
 
-This allows the backend interceptor to create a **child span** linked to the frontend trace.
+The session attribute key is:
+
+```java
+micrometer.session.trace.context
+```
+
+This makes the `CONNECT` span context available to later frames in the same WebSocket session.
+
+### `afterSendCompletion()`
+
+The `CONNECT` span is closed in `afterSendCompletion()`:
+
+```java
+Span span = CONNECT_SPAN_HOLDER.get();
+Tracer.SpanInScope scope = CONNECT_SCOPE_HOLDER.get();
+
+if (span != null && ex != null) {
+    span.error(ex);
+}
+if (scope != null) {
+    scope.close();
+    CONNECT_SCOPE_HOLDER.remove();
+}
+if (span != null) {
+    span.end();
+    CONNECT_SPAN_HOLDER.remove();
+}
+```
+
+If authentication or another inbound interceptor throws during `CONNECT`, the exception is recorded on the span.
 
 ---
 
-## Logging Configuration (`application.yaml`)
+## Lifecycle: `SEND`, `SUBSCRIBE`, `UNSUBSCRIBE`, `DISCONNECT`, `MESSAGE`
 
-To see traceId/spanId in logs:
+### `preSend()`
+
+For non-`CONNECT` supported commands, the interceptor:
+
+1. Reads destination, direction, and session ID
+2. Stores them as internal message headers
+3. Reads the session trace context from STOMP session attributes
+4. Stores that trace context into a message header for later use
+
+The message header key is:
+
+```java
+micrometer.trace.context
+```
+
+This allows `beforeHandle()` to create child spans using the `CONNECT` span context as parent.
+
+### `beforeHandle()`
+
+For supported non-`CONNECT` commands, the interceptor:
+
+1. Reads the internal metadata headers
+2. Reads the optional parent `TraceContext`
+3. Creates a span named `websocket.inbound` or `websocket.outbound`
+4. Sets the parent if a session trace context exists
+5. Opens the span scope
+6. Stores span/scope in `ThreadLocal`s
+
+Simplified flow:
+
+```java
+TraceContext parentContext = null;
+Object traceContext = headerAccessors.getHeader(TRACE_CONTEXT_KEY);
+if (traceContext instanceof TraceContext storedTraceContext) {
+    parentContext = storedTraceContext;
+}
+
+Span span = createSpan("websocket." + direction, parentContext, destination, direction, sessionId);
+Tracer.SpanInScope scope = tracer.withSpan(span);
+MESSAGE_SPAN_HOLDER.set(span);
+MESSAGE_SCOPE_HOLDER.set(scope);
+```
+
+### `afterMessageHandled()`
+
+After the handler completes, the interceptor:
+
+1. Records an error on the span if an exception exists
+2. Closes the span scope
+3. Ends the span
+4. Removes `ThreadLocal` values
+
+```java
+Span span = MESSAGE_SPAN_HOLDER.get();
+Tracer.SpanInScope scope = MESSAGE_SCOPE_HOLDER.get();
+
+if (span != null && ex != null) {
+    span.error(ex);
+}
+if (scope != null) {
+    scope.close();
+    MESSAGE_SCOPE_HOLDER.remove();
+}
+if (span != null) {
+    span.end();
+    MESSAGE_SPAN_HOLDER.remove();
+}
+```
+
+---
+
+## Trace Relationship Model
+
+The current implementation creates this relationship:
+
+```text
+CONNECT span: ws.authorization
+    ├── SEND span: websocket.inbound
+    ├── SUBSCRIBE span: websocket.inbound
+    ├── UNSUBSCRIBE span: websocket.inbound
+    ├── DISCONNECT span: websocket.inbound
+    └── MESSAGE span: websocket.outbound
+```
+
+The `CONNECT` span context is stored in the WebSocket session attributes and reused as the parent for later frames.
+
+Important nuance: the `CONNECT` span itself is ended after the `CONNECT` frame completes. Its `TraceContext` can still be used as a parent context for later spans, so all frames in the same WebSocket session can share the same trace lineage.
+
+---
+
+## Why Internal Headers Are Used
+
+The interceptor stores calculated values in internal message headers during `preSend()`:
+
+```java
+websocket.destination
+websocket.direction
+websocket.sessionId
+micrometer.trace.context
+```
+
+This is done because `preSend()` is the safest place to read and write message headers while they are still mutable.
+
+Later, `beforeHandle()` can read those values even though headers may already be immutable.
+
+---
+
+## Why `isMutable()` Is Checked
+
+Some STOMP messages, especially framework-generated messages, may have immutable headers. Calling `setHeader()` on immutable headers throws:
+
+```text
+IllegalStateException: Already immutable
+```
+
+The current implementation avoids this by returning early when headers are not mutable:
+
+```java
+if (headerAccessors == null || !headerAccessors.isMutable()) {
+    return message;
+}
+```
+
+This means immutable frames are skipped by this interceptor rather than causing the WebSocket pipeline to fail.
+
+---
+
+## Why `ThreadLocal` Is Used
+
+`Span` and `SpanInScope` must be available later in the same processing lifecycle so they can be closed correctly.
+
+The implementation uses separate `ThreadLocal`s for `CONNECT` and normal message handling:
+
+```java
+private static final ThreadLocal<Span> CONNECT_SPAN_HOLDER = new ThreadLocal<>();
+private static final ThreadLocal<Tracer.SpanInScope> CONNECT_SCOPE_HOLDER = new ThreadLocal<>();
+private static final ThreadLocal<Span> MESSAGE_SPAN_HOLDER = new ThreadLocal<>();
+private static final ThreadLocal<Tracer.SpanInScope> MESSAGE_SCOPE_HOLDER = new ThreadLocal<>();
+```
+
+This avoids storing mutable span/scope objects in STOMP headers and avoids the previous `Already immutable` issue.
+
+The implementation also removes the values after use, which is important because STOMP channels use executor threads that are reused for many messages.
+
+---
+
+## Current Implementation Code Shape
+
+The current interceptor has this structure:
+
+```java
+@Configuration
+public class WebsocketTracingChannelInterceptor implements ExecutorChannelInterceptor {
+    private final Tracer tracer;
+
+    @Override
+    public Message<?> preSend(Message<?> message, MessageChannel channel) {
+        // Resolve STOMP command, destination, direction, sessionId
+        // Store metadata headers while mutable
+        // For CONNECT: create ws.authorization span and store session TraceContext
+        // For other commands: copy session TraceContext into message header
+    }
+
+    @Override
+    public Message<?> beforeHandle(Message<?> message, MessageChannel channel, MessageHandler handler) {
+        // For supported non-CONNECT commands:
+        // create websocket.inbound/outbound span
+        // use stored TraceContext as parent when available
+        // open span scope
+    }
+
+    @Override
+    public void afterSendCompletion(Message<?> message, MessageChannel channel, boolean sent, Exception ex) {
+        // Close/end CONNECT span
+    }
+
+    @Override
+    public void afterMessageHandled(Message<?> message, MessageChannel channel, MessageHandler handler, Exception ex) {
+        // Close/end normal message span
+    }
+}
+```
+
+---
+
+## Logging Configuration
+
+Trace and span IDs are included in logs through the logging correlation pattern in `application.yaml`:
 
 ```yaml
 logging:
@@ -257,68 +362,194 @@ logging:
     correlation: "[${spring.application.name:},%X{traceId:-},%X{spanId:-}]"
 ```
 
+Example log shape:
+
+```text
+[spring-boot-4-websocket,52ef1a99a57e29c6cd5fe6bf0daf6cd7,d16827a59e735d47]
+```
+
+---
+
+## Tracing Configuration
+
+Tracing is configured through Spring Boot Actuator/Micrometer properties:
+
+```yaml
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+    export:
+      enabled: true
+```
+
+`probability: 1.0` means every trace is sampled. This is useful for learning and local testing. In production, consider reducing it depending on traffic volume.
+
+The project also has:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-opentelemetry</artifactId>
+</dependency>
+```
+
+This provides OpenTelemetry integration/export support through Spring Boot, while the interceptor itself uses Micrometer's `Tracer` abstraction directly.
+
+---
+
+## Current Limitations
+
+### 1. No frontend `traceparent` extraction in the current code
+
+An earlier design extracted W3C `traceparent` headers from STOMP native headers. The current implementation does **not** directly extract frontend `traceparent` / `tracestate` headers.
+
+Instead, it creates a new `CONNECT` span and uses that span context as the parent for later STOMP frames in the same session.
+
+If frontend-to-backend distributed trace continuity is required, the interceptor would need to add explicit propagation extraction from STOMP native headers.
+
+### 2. Parent context is session-based
+
+All later frames use the stored `CONNECT` trace context as parent when available. This groups WebSocket activity by session, but it does not create a separate parent trace per frontend action unless additional `traceparent` extraction is implemented.
+
+### 3. Immutable messages are skipped
+
+If a message has immutable headers by the time `preSend()` runs, this interceptor returns the message unchanged. This is safer than failing the WebSocket pipeline, but it means such frames may not get custom WebSocket spans.
+
+---
+
+## Optional Future Enhancement: Frontend Trace Propagation
+
+If the frontend uses OpenTelemetry JS and sends W3C trace context headers with STOMP frames, the backend can extract them from native headers.
+
+Frontend example:
+
+```javascript
+const span = tracer.startSpan('websocket.send');
+const ctx = trace.setSpan(context.active(), span);
+
+const headers = {};
+propagation.inject(ctx, headers);
+
+stompClient.publish({
+  destination: '/app/notification',
+  headers: {
+    traceparent: headers.traceparent,
+    tracestate: headers.tracestate || ''
+  },
+  body: JSON.stringify({ content: 'hello world' })
+});
+
+span.end();
+```
+
+Backend support would require adding an OpenTelemetry `TextMapGetter<StompHeaderAccessor>` or Micrometer propagation extraction, then using the extracted context as the parent for the message span.
+
+This is not part of the current implementation.
+
 ---
 
 ## Common Errors
 
 ### `IllegalStateException: Already immutable`
 
-**Cause:** Trying to call `setHeader()` on message headers after they've been made immutable (e.g., system-generated `DISCONNECT` frames).
+Cause: calling `setHeader()` after Spring has made message headers immutable.
 
-**Solution:** Add `headerAccessors.isMutable()` check before any `setHeader()` call. Messages with immutable headers will be skipped (no tracing for those frames).
+Current mitigation:
 
-### OTel Context Scope Leak
+```java
+if (headerAccessors == null || !headerAccessors.isMutable()) {
+    return message;
+}
+```
 
-**Cause:** `extractedContext.makeCurrent()` returns a `Scope` that must be explicitly closed. If not closed, trace context leaks to other messages processed on the same thread.
+### Missing trace/span IDs in `@MessageMapping` logs
 
-**Solution:** Store the OTel `Scope` in a `ThreadLocal` and close it in `afterMessageHandled()`.
+Check that:
+
+1. `WebsocketTracingChannelInterceptor` is registered in `configureClientInboundChannel()`
+2. The method is executed for a supported STOMP command
+3. The span scope is opened in `beforeHandle()`
+4. The logging pattern includes `%X{traceId}` and `%X{spanId}`
+5. Tracing dependencies are on the classpath
+
+### Missing trace/span IDs on outbound messages
+
+Check that:
+
+1. `WebsocketTracingChannelInterceptor` is registered in `configureClientOutboundChannel()`
+2. The outbound frame command is `MESSAGE`
+3. The message has a session ID and/or session attributes available
 
 ---
 
-## How It Works — Lifecycle
+## How It Works End-to-End
 
-```
-1. Client sends STOMP SEND to /app/notification (with optional traceparent header)
+```text
+1. Client sends STOMP CONNECT
 
-2. preSend() [headers still mutable]
-   → Check isMutable() to avoid immutable header errors
-   → Extract traceparent from native headers (if present) → open OTel scope
-   → Create Observation with direction, destination, sessionId tags → start it
-   → Store Observation in message header
+2. preSend(CONNECT)
+   -> create ws.authorization span
+   -> open span scope
+   -> store TraceContext in session attributes
 
-3. Message dispatched to handler thread
+3. Authorization/session interceptors run
+   -> auth failures are attached to the CONNECT span when propagated as channel exceptions
 
-4. beforeHandle() [same thread as handler]
-   → Read Observation from header
-   → Open Observation Scope (puts traceId/spanId into MDC)
-   → Store scope in ThreadLocal
+4. afterSendCompletion(CONNECT)
+   -> record error if present
+   -> close CONNECT scope
+   -> end CONNECT span
 
-5. @MessageMapping method executes
-   → Logs now contain traceId/spanId
-   → Any downstream calls (HTTP, Kafka, DB) inherit the trace context
+5. Client sends SEND /app/notification
 
-6. afterMessageHandled() [same thread as handler]
-   → Close Observation Scope (opened last → closed first)
-   → Stop Observation
-   → Close OTel Scope (opened first → closed last)
-   → Remove all ThreadLocals to prevent leaks
+6. preSend(SEND)
+   -> copy session TraceContext into message headers
+   -> store destination/direction/sessionId headers
+
+7. beforeHandle(SEND)
+   -> create websocket.inbound span
+   -> set parent to stored session TraceContext
+   -> open span scope
+
+8. @MessageMapping executes
+   -> logs include traceId/spanId
+
+9. afterMessageHandled(SEND)
+   -> record handler error if present
+   -> close scope
+   -> end span
+
+10. Server sends MESSAGE to client
+
+11. outbound preSend/beforeHandle/afterMessageHandled
+   -> create websocket.outbound span
+   -> close/end after delivery handling
 ```
 
 ---
 
 ## Key Concepts
 
-| Concept                          | Description                                                                                           |
-|----------------------------------|-------------------------------------------------------------------------------------------------------|
-| `Observation`                    | Micrometer's abstraction for a unit of work — generates traces and metrics                            |
-| `Observation.Scope`              | When opened, puts trace context (traceId/spanId) into the current thread's MDC                        |
-| `io.opentelemetry.context.Scope` | OTel scope from `makeCurrent()` — must be closed to prevent context leaks                             |
-| `ExecutorChannelInterceptor`     | Extends `ChannelInterceptor` with `beforeHandle`/`afterMessageHandled` that run on the handler thread |
-| `ThreadLocal`                    | Thread-scoped storage — safe because `beforeHandle` and `afterMessageHandled` run on the same thread  |
-| `isMutable()`                    | Check before `setHeader()` — some frames (e.g., system DISCONNECT) have immutable headers             |
-| `TextMapGetter`                  | OTel interface to extract propagation headers from a carrier (here: STOMP native headers)             |
-| `traceparent`                    | W3C Trace Context header — carries traceId and spanId for distributed tracing                         |
-| MDC (Mapped Diagnostic Context)  | SLF4J mechanism for attaching context (like traceId) to log statements                                |
-| Low-cardinality key values       | Tags with bounded values (e.g., direction, destination) — safe for metrics                            |
-| High-cardinality key values      | Tags with unbounded values (e.g., sessionId) — appear in traces only, not metrics                     |
-| LIFO scope closing               | Scopes must be closed in reverse order of opening to maintain correct context nesting                 |
+| Concept                      | Description                                                                             |
+|------------------------------|-----------------------------------------------------------------------------------------|
+| `Tracer`                     | Micrometer abstraction used to create spans                                             |
+| `Span`                       | A traced unit of work, such as `CONNECT` or `SEND` handling                             |
+| `TraceContext`               | Trace identity stored in session attributes and reused as parent context                |
+| `SpanInScope`                | Scope that makes the span current on the executing thread                               |
+| `ExecutorChannelInterceptor` | STOMP channel interceptor with handler-thread callbacks                                 |
+| `ThreadLocal`                | Used to hold span/scope until the matching completion callback                          |
+| `StompHeaderAccessor`        | Gives access to STOMP command, destination, session ID, session attributes, and headers |
+| `isMutable()`                | Prevents writing headers after Spring marks them immutable                              |
+| MDC                          | Logging context where traceId/spanId are made available by tracing instrumentation      |
+| `CONNECT` span               | Session-root span currently used as parent context for later STOMP frame spans          |
+
+---
+
+## Production Notes
+
+- Keep `sessionId` as trace metadata only. Do not use it as a low-cardinality metric tag in custom metrics because it has very high cardinality.
+- Consider lowering sampling below `1.0` in production for high-traffic systems.
+- If you need browser-to-backend trace continuity, add explicit `traceparent` extraction from STOMP native headers.
+- Keep `ThreadLocal` cleanup mandatory. Executor threads are reused and leaked trace context can corrupt logs/traces for unrelated messages.
+- Register tracing before auth/rate-limit interceptors if you want rejected frames to be traced.

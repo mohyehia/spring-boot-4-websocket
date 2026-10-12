@@ -121,12 +121,12 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
     @Override
     public void configureClientInboundChannel(ChannelRegistration registration) {
         registration.interceptors(
+                websocketTracingChannelInterceptor,
                 authorizationInterceptor,
                 securityContextChannelInterceptor,
                 sessionLimitPerUserInterceptor,
                 authorizationChannelInterceptor,
-                messagesPerSessionRateLimiterInterceptor,
-                websocketTracingChannelInterceptor
+                messagesPerSessionRateLimiterInterceptor
         );
     }
 
